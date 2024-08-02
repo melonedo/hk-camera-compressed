@@ -1,0 +1,4 @@
+[submodule "GPUJPEG"]
+	path = GPUJPEG
+	url = https://github.com/CESNET/GPUJPEG.git
+	branch = 005ea2a
