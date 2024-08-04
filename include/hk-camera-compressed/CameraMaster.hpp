@@ -1,63 +1,171 @@
-#include "JPEGEncoder.hpp"
-#include "MvCameraControl.h"
-#include "hk-utils.hpp"
+#include <deque>
 #include <fstream>
 #include <thread>
 
+#include "JPEGEncoder.hpp"
+#include "MvCameraControl.h"
+#include "hk-utils.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/compressed_image.hpp"
 
 // Depends on nRet and camName
-#define CHECK_MV_OR(call, action)                                              \
-  {                                                                            \
-    nRet = (call);                                                             \
-    if (nRet != MV_OK) {                                                       \
-      printf("Cam[%s]: " #call " failed[%x]\n", camName, nRet);                \
-      action;                                                                  \
-    }                                                                          \
+#define CHECK_MV_OR(call, action)                               \
+  {                                                             \
+    nRet = (call);                                              \
+    if (nRet != MV_OK) {                                        \
+      printf("Cam[%s]: " #call " failed[%x]\n", camName, nRet); \
+      action;                                                   \
+    }                                                           \
   }
 
 #define CHECK_MV(call) CHECK_MV_OR(call, )
 #define CHECK_MV_RETURN(call) CHECK_MV_OR(call, return nRet)
 
+struct MVFrameGPU {
+  void *buf;
+  MV_FRAME_OUT_INFO_EX info;
+  bool used;
+};
+
+class DeviceMemoryQueue {
+  std::vector<MVFrameGPU> frames;
+  std::deque<unsigned> queue;
+  std::mutex lock;
+  std::condition_variable cond;
+  size_t size;
+  unsigned received;
+  unsigned dropped;
+  unsigned last_num = 0;
+
+ public:
+  DeviceMemoryQueue(unsigned len, size_t size_)
+      : frames(len), size(size_), received(0), dropped(0) {
+    for (unsigned i = 0; i < len; i++) {
+      CHECK_CUDA(cudaMalloc(&frames[i].buf, size));
+      frames[i].used = false;
+    }
+  }
+
+  ~DeviceMemoryQueue() {
+    for (unsigned i = 0; i < frames.size(); i++) {
+      CHECK_CUDA(cudaFree(frames[i].buf));
+    }
+  }
+
+  DeviceMemoryQueue(const DeviceMemoryQueue &) = delete;
+  DeviceMemoryQueue &operator=(const DeviceMemoryQueue &) = delete;
+
+  bool enqueue(const MV_FRAME_OUT &frame) {
+    if (last_num && last_num != frame.stFrameInfo.nFrameNum - 1) {
+      std::cout << frame.stFrameInfo.nFrameNum - 1 - last_num
+                << " Frames not processed\n";
+    }
+    last_num = frame.stFrameInfo.nFrameNum;
+
+    assert(frame.stFrameInfo.nFrameLen == size);
+    // Always prefer the lowest slot
+    unsigned i;
+    bool drop;
+    received++;
+    std::lock_guard l(lock);
+    auto it = std::find_if(frames.begin(), frames.end(),
+                           [](const MVFrameGPU &f) { return !f.used; });
+    drop = (it == frames.end());
+    if (drop) {
+      dropped++;
+      std::cout << "Dropped one frame " << drop << "/" << received << std::endl;
+      assert(queue.size() <= frames.size());
+      drop = true;
+      i = queue.back();
+      queue.pop_back();
+    } else {
+      i = std::distance(frames.begin(), it);
+    }
+    queue.push_front(i);
+    cond.notify_one();
+    CHECK_CUDA(cudaMemcpy(frames[i].buf, frame.pBufAddr, size,
+                          cudaMemcpyHostToDevice));
+    frames[i].info = frame.stFrameInfo;
+    frames[i].used = true;
+    return drop;
+  }
+
+  MVFrameGPU *dequeue(unsigned miliseconds) {
+    std::unique_lock l(lock);
+    bool res = cond.wait_for(l, std::chrono::milliseconds(miliseconds),
+                             [this]() { return !queue.empty(); });
+    if (res) {
+      unsigned i = queue.back();
+      queue.pop_back();
+      return &frames[i];
+    } else {
+      return nullptr;
+    }
+  }
+
+  void finish(MVFrameGPU *frame) {
+    std::lock_guard l(lock);
+    frame->used = false;
+  }
+};
+
 class FrameWorker {
   JPEGEncoder encoder;
   unsigned int nDataSize;
-  const char *camName;
+  std::string camName;
   using CompressedImage = sensor_msgs::msg::CompressedImage;
   rclcpp::Publisher<CompressedImage>::SharedPtr publisher;
+  std::unique_ptr<DeviceMemoryQueue> queue;
   unsigned int last_frame_num = 0;
   unsigned int lost_frame_count = 0;
   unsigned int total_frame_count = 0;
   static inline std::mutex creation_mutex;
-  FrameWorker(cudaStream_t s, unsigned int nDataSize_, const char *camName_,
-              const rclcpp::Publisher<CompressedImage>::SharedPtr &pub)
-      : encoder(s), nDataSize(nDataSize_), camName(camName_), publisher(pub) {}
+  FrameWorker(cudaStream_t s, unsigned nDataSize_, const char *camName_,
+              const rclcpp::Publisher<CompressedImage>::SharedPtr &pub,
+              unsigned buffer_num)
+      : encoder(s), nDataSize(nDataSize_), camName(camName_), publisher(pub) {
+    queue = std::make_unique<DeviceMemoryQueue>(buffer_num, nDataSize_);
+  }
 
-public:
-  static FrameWorker create(unsigned int nDataSize, const char *camName,
-                            int buffer_num, rclcpp::Node *node) {
+ public:
+  static FrameWorker create(void *handle, const char *camName,
+                            unsigned buffer_num, rclcpp::Node *node) {
     cudaStream_t s;
     CHECK_CUDA(cudaStreamCreate(&s));
-    using namespace std::literals::string_literals;
+
+    // ch:获取数据包大小 | en:Get payload size
+    int nRet = MV_OK;
+    MVCC_INTVALUE nDataSize = {};
+    CHECK_MV(MV_CC_GetIntValue(handle, "PayloadSize", &nDataSize));
+    if (MV_OK == nRet) {
+      printf("Cam[%s]: Payload size[%u]\n", camName, nDataSize.nCurValue);
+    }
+
     // Other wise FastDDS will complain:
     // [PARTICIPANT Error] Type with the same name already exists:
     // sensor_msgs::msg::dds_::CompressedImage_ -> Function registerType
     std::lock_guard l(creation_mutex);
+    using namespace std::literals::string_literals;
     auto pub = node->create_publisher<CompressedImage>("~/image/"s + camName,
                                                        buffer_num);
-    return {s, nDataSize, camName, pub};
+    return {s, nDataSize.nCurValue, camName, pub, buffer_num};
   }
 
-  void run(uint8_t *image_data, const MV_FRAME_OUT_INFO_EX &stImageInfo) {
+  void receive(const MV_FRAME_OUT &frame) { queue->enqueue(frame); }
+  MVFrameGPU *poll(unsigned miliseconds) { return queue->dequeue(miliseconds); }
+
+  void run(MVFrameGPU *frame) {
+    MV_FRAME_OUT_INFO_EX &stImageInfo = frame->info;
+    const char *camName = this->camName.c_str();
     // uint64_t timestamp = (uint64_t)stImageInfo.nDevTimeStampHigh << 32 |
     //                      stImageInfo.nDevTimeStampLow;
-    // printf("Cam Serial Number[%s]: GetOneFrame, Width[%d], Height[%d], "
+    // printf("Cam [%s]: GetOneFrame, Width[%d], Height[%d], "
     //        "nFrameNum[%d], timestamp[%ld], HostTimeStamp[%ld]\n",
     //        camName, stImageInfo.nWidth, stImageInfo.nHeight,
     //        stImageInfo.nFrameNum, timestamp, stImageInfo.nHostTimeStamp);
 
-    cv::Mat image(stImageInfo.nHeight, stImageInfo.nWidth, CV_8UC1, image_data);
+    cv::cuda::GpuMat image(stImageInfo.nHeight, stImageInfo.nWidth, CV_8UC1,
+                           frame->buf);
     uint8_t *out;
     size_t len;
     int nRet = MV_OK;
@@ -73,13 +181,14 @@ public:
     //   cv::imshow(camName, image);
     //   cv::waitKey(1);
     // }
+    queue->finish(frame);
 
     CompressedImage image_msg;
     image_msg.format = "jpeg";
     image_msg.data = {out, out + len};
     image_msg.header.frame_id = stImageInfo.nFrameNum;
     // FIXME: use correct timestamp
-    image_msg.header.stamp.sec = stImageInfo.nHostTimeStamp / 1000000;
+    image_msg.header.stamp.sec = stImageInfo.nHostTimeStamp / 1000;
     image_msg.header.stamp.nanosec =
         stImageInfo.nHostTimeStamp % 1000 * 1000000;
     publisher->publish(image_msg);
@@ -87,6 +196,7 @@ public:
     if (last_frame_num == 0) {
       last_frame_num = stImageInfo.nFrameNum;
     } else {
+      assert(last_frame_num < stImageInfo.nFrameNum);
       lost_frame_count += stImageInfo.nFrameNum - 1 - last_frame_num;
       total_frame_count += stImageInfo.nFrameNum - last_frame_num;
       if (stImageInfo.nFrameNum != last_frame_num + 1) {
@@ -101,12 +211,14 @@ public:
 class CameraMaster {
   std::atomic_bool running;
   std::vector<void *> handles;
-  std::vector<std::thread> threads;
+  std::vector<std::thread> work_threads;
+  std::vector<std::thread> receive_threads;
+  std::vector<FrameWorker> frame_workers;
   // 缓冲区大小为帧率*buffer_time+1
-  const float buffer_time = 0.01;
+  const float buffer_time = 0.05;
   rclcpp::Node::SharedPtr node;
 
-public:
+ public:
   // Should not need this
   // ~CameraMaster() { stop(); }
 
@@ -145,6 +257,7 @@ public:
     // 提示为多相机测试
     // Tips for multicamera testing
     printf("Start %d camera Grabbing Image test\n", stDeviceList.nDeviceNum);
+    handles.clear();
     for (unsigned i = 0; i < stDeviceList.nDeviceNum; i++) {
       const char *camName = GetCameraName(stDeviceList.pDeviceInfo[i]);
       void *handle;
@@ -181,7 +294,10 @@ public:
   int start_grabbing() {
     int nRet;
     running.store(true);
-    threads.resize(handles.size());
+    receive_threads.clear();
+    work_threads.clear();
+    frame_workers.clear();
+    frame_workers.reserve(handles.size());
     for (unsigned i = 0; i < handles.size(); i++) {
       MVCC_STRINGVALUE camName_;
       const char *camName = camName_.chCurValue;
@@ -201,12 +317,22 @@ public:
              frame_rate.fCurValue);
 
       int buffer_num = 1 + frame_rate.fCurValue * buffer_time;
-      CHECK_MV_RETURN(MV_CC_SetImageNodeNum(handles[i], buffer_num));
+      CHECK_MV_RETURN(MV_CC_SetImageNodeNum(handles[i], 1));
       // 开始取流
       // start grab image
       CHECK_MV_RETURN(MV_CC_StartGrabbing(handles[i]));
-      threads[i] = std::thread(
-          [this, i, buffer_num]() { WorkThread(handles[i], buffer_num); });
+
+      frame_workers.emplace_back(
+          FrameWorker::create(handles[i], camName, buffer_num, node.get()));
+      receive_threads.emplace_back(
+          [=]() { ReceiveThread(handles[i], frame_workers[i], camName); });
+      work_threads.emplace_back([=]() {
+        while (running.load(std::memory_order_relaxed)) {
+          if (MVFrameGPU *frame = frame_workers[i].poll(100)) {
+            frame_workers[i].run(frame);
+          }
+        }
+      });
     }
     return nRet;
   }
@@ -214,13 +340,14 @@ public:
   int stop() {
     int nRet = MV_OK;
     running.store(false, std::memory_order_relaxed);
-    for (auto &t : threads) {
+    for (auto &t : receive_threads) {
       t.join();
     }
-    threads.clear();
+    for (auto &t : work_threads) {
+      t.join();
+    }
     for (void *&handle : handles) {
-      if (!handle)
-        continue;
+      if (!handle) continue;
       // 停止取流
       // end grab image
       nRet = MV_CC_StopGrabbing(handle);
@@ -248,43 +375,14 @@ public:
     return nRet;
   }
 
-  void WorkThread(void *handle, int buffer_num) {
+  void ReceiveThread(void *handle, FrameWorker &frame_worker,
+                     const char *camName) {
     int nRet = MV_OK;
-    char camName[256];
-    {
-      MVCC_STRINGVALUE stStringValue = {};
-      CHECK_MV(MV_CC_GetStringValue(handle, "DeviceUserID", &stStringValue));
-      if (MV_OK == nRet) {
-        memcpy(camName, stStringValue.chCurValue,
-               sizeof(stStringValue.chCurValue));
-      }
-    }
-    // ch:获取数据包大小 | en:Get payload size
-    unsigned int nDataSize;
-    {
-      MVCC_INTVALUE stParam = {};
-      CHECK_MV(MV_CC_GetIntValue(handle, "PayloadSize", &stParam));
-      if (MV_OK != nRet) {
-        return;
-      } else {
-        printf("Cam[%s]: Payload size[%u]\n", camName, stParam.nCurValue);
-      }
-      nDataSize = stParam.nCurValue;
-    }
-    // std::vector<uint8_t> buf(nDataSize);
-    // MV_FRAME_OUT_INFO_EX stImageInfo = {};
-
-    // cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
-    FrameWorker frame_worker =
-        FrameWorker::create(nDataSize, camName, buffer_num, node.get());
     while (running.load(std::memory_order_relaxed)) {
-      // nRet = MV_CC_GetOneFrameTimeout(handle, buf.data(), nDataSize,
-      //                                 &stImageInfo, 100);
       MV_FRAME_OUT frame;
-      MV_FRAME_OUT_INFO_EX &stImageInfo = frame.stFrameInfo;
       CHECK_MV_OR(MV_CC_GetImageBuffer(handle, &frame, 100), continue);
 
-      frame_worker.run(frame.pBufAddr, stImageInfo);
+      frame_worker.receive(frame);
 
       CHECK_MV(MV_CC_FreeImageBuffer(handle, &frame));
 
@@ -326,7 +424,6 @@ public:
       if (nRet == MV_OK)
         printf("Cam[%s]: ADCBitDepth: %u\n", camName, ADCBitDepth.nCurValue);
     } else if ("Color"s == camName) {
-
     } else {
       printf("Warning: unrecognized camera\n");
     }
