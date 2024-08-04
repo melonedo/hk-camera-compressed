@@ -7,6 +7,19 @@
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/compressed_image.hpp"
 
+// Depends on nRet and camName
+#define CHECK_MV_OR(call, action)                                              \
+  {                                                                            \
+    nRet = (call);                                                             \
+    if (nRet != MV_OK) {                                                       \
+      printf("Cam[%s]: " #call " failed[%x]\n", camName, nRet);                \
+      action;                                                                  \
+    }                                                                          \
+  }
+
+#define CHECK_MV(call) CHECK_MV_OR(call, )
+#define CHECK_MV_RETURN(call) CHECK_MV_OR(call, return nRet)
+
 class FrameWorker {
   JPEGEncoder encoder;
   unsigned int nDataSize;
@@ -132,32 +145,24 @@ public:
     // 提示为多相机测试
     // Tips for multicamera testing
     printf("Start %d camera Grabbing Image test\n", stDeviceList.nDeviceNum);
-    handles.resize(stDeviceList.nDeviceNum);
     for (unsigned i = 0; i < stDeviceList.nDeviceNum; i++) {
       const char *camName = GetCameraName(stDeviceList.pDeviceInfo[i]);
       void *handle;
-      nRet = MV_CC_CreateHandle(&handle, stDeviceList.pDeviceInfo[i]);
-      if (MV_OK != nRet) {
-        printf("MV_CC_CreateHandle fail! nRet [%x]\n", nRet);
-        return nRet;
-      }
+      CHECK_MV_RETURN(MV_CC_CreateHandle(&handle, stDeviceList.pDeviceInfo[i]));
       // 打开设备
       // open device
-      nRet = MV_CC_OpenDevice(handle);
-      if (MV_OK != nRet) {
-        printf("MV_CC_OpenDevice fail! nRet [%x]\n", nRet);
-        return nRet;
-      }
+      // FIXME: the handle is leaked
+      CHECK_MV_OR(MV_CC_OpenDevice(handle), {
+        nRet = MV_OK;
+        continue;
+      });
 
       // ch:探测网络最佳包大小(只对GigE相机有效) | en:Detection network optimal
       // package size(It only works for the GigE camera)
       if (stDeviceList.pDeviceInfo[i]->nTLayerType == MV_GIGE_DEVICE) {
         int nPacketSize = MV_CC_GetOptimalPacketSize(handle);
         if (nPacketSize > 0) {
-          nRet = MV_CC_SetIntValue(handle, "GevSCPSPacketSize", nPacketSize);
-          if (nRet != MV_OK) {
-            printf("Warning: Set Packet Size fail nRet [0x%x]!\n", nRet);
-          }
+          CHECK_MV(MV_CC_SetIntValue(handle, "GevSCPSPacketSize", nPacketSize));
         } else {
           printf("Warning: Get Packet Size fail nRet [0x%x]!\n", nPacketSize);
         }
@@ -165,13 +170,9 @@ public:
 
       // 设置触发模式为off
       // set trigger mode as off
-      nRet = MV_CC_SetEnumValue(handle, "TriggerMode", MV_TRIGGER_MODE_OFF);
-      if (MV_OK != nRet) {
-        printf("Cam[%s]: MV_CC_SetTriggerMode fail! nRet [%x]\n", camName,
-               nRet);
-      }
+      CHECK_MV(MV_CC_SetEnumValue(handle, "TriggerMode", MV_TRIGGER_MODE_OFF));
       config_camera(handle, camName);
-      handles[i] = handle;
+      handles.push_back(handle);
     }
     return nRet;
   }
@@ -194,28 +195,16 @@ public:
 
       // 计算需要的缓存帧数
       MVCC_FLOATVALUE frame_rate;
-      nRet = MV_CC_GetFloatValue(handles[i], "ResultingFrameRate", &frame_rate);
+      CHECK_MV_RETURN(
+          MV_CC_GetFloatValue(handles[i], "ResultingFrameRate", &frame_rate));
       printf("Cam[%s]: Resulting Frame Rate: %f\n", camName,
              frame_rate.fCurValue);
-      if (MV_OK != nRet) {
-        printf("Cam[%s]: Get ResultingFrameRate fail! nRet [%x]\n", camName,
-               nRet);
-        return nRet;
-      }
+
       int buffer_num = 1 + frame_rate.fCurValue * buffer_time;
-      nRet = MV_CC_SetImageNodeNum(handles[i], buffer_num);
-      if (MV_OK != nRet) {
-        printf("Cam[%s]: MV_CC_SetImageNodeNum fail! nRet [%x]\n", camName,
-               nRet);
-        return nRet;
-      }
+      CHECK_MV_RETURN(MV_CC_SetImageNodeNum(handles[i], buffer_num));
       // 开始取流
       // start grab image
-      nRet = MV_CC_StartGrabbing(handles[i]);
-      if (MV_OK != nRet) {
-        printf("Cam[%s]: MV_CC_StartGrabbing fail! nRet [%x]\n", camName, nRet);
-        return nRet;
-      }
+      CHECK_MV_RETURN(MV_CC_StartGrabbing(handles[i]));
       threads[i] = std::thread(
           [this, i, buffer_num]() { WorkThread(handles[i], buffer_num); });
     }
@@ -264,21 +253,18 @@ public:
     char camName[256];
     {
       MVCC_STRINGVALUE stStringValue = {};
-      nRet = MV_CC_GetStringValue(handle, "DeviceUserID", &stStringValue);
+      CHECK_MV(MV_CC_GetStringValue(handle, "DeviceUserID", &stStringValue));
       if (MV_OK == nRet) {
         memcpy(camName, stStringValue.chCurValue,
                sizeof(stStringValue.chCurValue));
-      } else {
-        printf("Get DeviceUserID Failed! nRet = [%x]\n", nRet);
       }
     }
     // ch:获取数据包大小 | en:Get payload size
     unsigned int nDataSize;
     {
       MVCC_INTVALUE stParam = {};
-      nRet = MV_CC_GetIntValue(handle, "PayloadSize", &stParam);
+      CHECK_MV(MV_CC_GetIntValue(handle, "PayloadSize", &stParam));
       if (MV_OK != nRet) {
-        printf("Get PayloadSize fail! nRet [0x%x]\n", nRet);
         return;
       } else {
         printf("Cam[%s]: Payload size[%u]\n", camName, stParam.nCurValue);
@@ -296,15 +282,11 @@ public:
       //                                 &stImageInfo, 100);
       MV_FRAME_OUT frame;
       MV_FRAME_OUT_INFO_EX &stImageInfo = frame.stFrameInfo;
-      nRet = MV_CC_GetImageBuffer(handle, &frame, 100);
-      if (nRet != MV_OK) {
-        printf("Cam[%s]: Get One Frame failed![%x]\n", camName, nRet);
-        continue;
-      }
+      CHECK_MV_OR(MV_CC_GetImageBuffer(handle, &frame, 100), continue);
 
       frame_worker.run(frame.pBufAddr, stImageInfo);
 
-      MV_CC_FreeImageBuffer(handle, &frame);
+      CHECK_MV(MV_CC_FreeImageBuffer(handle, &frame));
 
       // unsigned valid_num;
       // nRet = MV_CC_GetValidImageNum(handle, &valid_num);
@@ -323,35 +305,26 @@ public:
     using namespace std::literals::string_literals;
     int nRet = MV_OK;
     std::string feature_file = "configs/"s + camName + ".ini";
-    nRet = MV_CC_FeatureSave(handle, feature_file.c_str());
-    if (nRet != MV_OK)
-      printf("Cam[%s]: MV_CC_FeatureSave Failed: %x\n", camName, nRet);
+    CHECK_MV(MV_CC_FeatureSave(handle, feature_file.c_str()));
 
     std::vector<uint8_t> xml_buf;
     unsigned xml_len;
-    MV_XML_GetGenICamXML(handle, NULL, 0, &xml_len);
+    nRet = MV_XML_GetGenICamXML(handle, NULL, 0, &xml_len);
+    assert((unsigned)nRet == MV_E_PARAMETER);
     xml_buf.resize(xml_len);
-    nRet =
-        MV_XML_GetGenICamXML(handle, xml_buf.data(), xml_buf.size(), &xml_len);
-    if (nRet != MV_OK)
-      printf("Cam[%s]: MV_XML_GetGenICamXML Failed: %x\n", camName, nRet);
-    else {
+    CHECK_MV(
+        MV_XML_GetGenICamXML(handle, xml_buf.data(), xml_buf.size(), &xml_len));
+    if (nRet == MV_OK) {
       std::ofstream xml_file("configs/"s + camName + ".xml", std::ios::binary);
       xml_file.write(reinterpret_cast<const char *>(xml_buf.data()), xml_len);
     }
 
     if ("Fast"s == camName) {
-      nRet = MV_CC_SetEnumValueByString(handle, "ADCBitDepth", "Bits_8");
-      if (nRet != MV_OK) {
-        printf("Cam[%s]: Set ADCBitDepth Failed: %x\n", camName, nRet);
-      }
+      CHECK_MV(MV_CC_SetEnumValueByString(handle, "ADCBitDepth", "Bits_8"));
       MVCC_ENUMVALUE ADCBitDepth;
-      nRet = MV_CC_GetEnumValue(handle, "ADCBitDepth", &ADCBitDepth);
-      if (nRet != MV_OK) {
-        printf("Cam[%s]: Get ADCBitDepth Failed: %x\n", camName, nRet);
-      } else {
+      CHECK_MV(MV_CC_GetEnumValue(handle, "ADCBitDepth", &ADCBitDepth));
+      if (nRet == MV_OK)
         printf("Cam[%s]: ADCBitDepth: %u\n", camName, ADCBitDepth.nCurValue);
-      }
     } else if ("Color"s == camName) {
 
     } else {

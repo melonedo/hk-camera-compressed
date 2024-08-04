@@ -42,8 +42,10 @@ int start_cameras() {
 
   CameraMaster master;
   pMaster = &master;
-  master.init();
-  master.start_grabbing();
+  if (master.init())
+    return EXIT_FAILURE;
+  if (master.start_grabbing())
+    return EXIT_FAILURE;
 
   fprintf(stderr, "Press enter or ctrl+c to exit.\n");
   while (getchar() != '\n')
