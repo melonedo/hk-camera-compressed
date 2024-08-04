@@ -1,18 +1,20 @@
-#include "libgpujpeg/gpujpeg.h"
-#include "src/gpujpeg_encoder_internal.h"
-#include <atomic>
 #include <cuda_runtime.h>
+
+#include <atomic>
 #include <opencv2/cudaimgproc.hpp>
 #include <opencv2/opencv.hpp>
 
-#define CHECK_CUDA(call)                                                       \
-  {                                                                            \
-    cudaError_t _e = (call);                                                   \
-    if (_e != cudaSuccess) {                                                   \
-      std::cout << "CUDA Runtime failure: '#" << _e << "' at " << __FILE__     \
-                << ":" << __LINE__ << std::endl;                               \
-      exit(1);                                                                 \
-    }                                                                          \
+#include "libgpujpeg/gpujpeg.h"
+#include "src/gpujpeg_encoder_internal.h"
+
+#define CHECK_CUDA(call)                                                \
+  {                                                                     \
+    cudaError_t _e = (call);                                            \
+    if (_e != cudaSuccess) {                                            \
+      std::cout << "CUDA Runtime failure: '" << cudaGetErrorString(_e)  \
+                << "' at " << __FILE__ << ":" << __LINE__ << std::endl; \
+      exit(1);                                                          \
+    }                                                                   \
   }
 
 struct JPEGEncoder {
@@ -30,14 +32,20 @@ struct JPEGEncoder {
     param.restart_interval = RESTART_AUTO;
   }
   ~JPEGEncoder() {
-    if (encoder)
-      gpujpeg_encoder_destroy(encoder);
+    if (encoder) gpujpeg_encoder_destroy(encoder);
   }
   JPEGEncoder(const JPEGEncoder &) = delete;
   JPEGEncoder &operator=(const JPEGEncoder &) = delete;
   JPEGEncoder(JPEGEncoder &&other) noexcept
       : encoder(other.encoder), param(other.param) {
     other.encoder = nullptr;
+  }
+  JPEGEncoder &operator=(JPEGEncoder &&other) {
+    if (encoder) gpujpeg_encoder_destroy(encoder);
+    encoder = other.encoder;
+    param = other.param;
+    other.encoder = nullptr;
+    return *this;
   }
 
   int encode(const struct gpujpeg_image_parameters *param_image,
@@ -59,17 +67,19 @@ struct JPEGEncoder {
                   output_image_size);
   }
 
-  // Convert Bayer RGGB8 to RGB and encode
   int encode_bayer(const cv::Mat &image, uint8_t **output_image,
                    size_t *output_image_size, bool async = false) {
+    cv::cuda::GpuMat gpu_image;
+    gpu_image.upload(image);
+    return encode_bayer(gpu_image, output_image, output_image_size, async);
+  }
+
+  // Convert Bayer RGGB8 to RGB and encode
+  int encode_bayer(const cv::cuda::GpuMat &image, uint8_t **output_image,
+                   size_t *output_image_size, bool async = false) {
     assert(image.elemSize() == 1);
-    struct gpujpeg_image_parameters param_image {
-      image.cols, image.rows, GPUJPEG_RGB, GPUJPEG_444_U8_P012
-    };
-    struct gpujpeg_encoder_input encoder_input;
-    cv::cuda::GpuMat bayer, rgb;
-    bayer.upload(image);
-    cv::cuda::demosaicing(bayer, rgb, cv::COLOR_BayerRG2RGB);
+    cv::cuda::GpuMat rgb;
+    cv::cuda::demosaicing(image, rgb, cv::COLOR_BayerRG2RGB);
     // assert(rgb.isContinuous());
     void *buf;
     if (async) {
@@ -84,6 +94,10 @@ struct JPEGEncoder {
                               image.cols * 3, image.rows,
                               cudaMemcpyDeviceToDevice));
     }
+    struct gpujpeg_image_parameters param_image {
+      image.cols, image.rows, GPUJPEG_RGB, GPUJPEG_444_U8_P012
+    };
+    struct gpujpeg_encoder_input encoder_input;
     gpujpeg_encoder_input_set_gpu_image(&encoder_input, (uint8_t *)buf);
     int rc =
         encode(&param_image, &encoder_input, output_image, output_image_size);
