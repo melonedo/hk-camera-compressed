@@ -1,9 +1,9 @@
-#include "JPEGEncoder.hpp"
-#include "MvCameraControl.h"
-#include "hk-utils.hpp"
 #include <fstream>
 #include <thread>
 
+#include "JPEGEncoder.hpp"
+#include "MvCameraControl.h"
+#include "hk-utils.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/compressed_image.hpp"
 
@@ -20,6 +20,63 @@
 #define CHECK_MV(call) CHECK_MV_OR(call, )
 #define CHECK_MV_RETURN(call) CHECK_MV_OR(call, return nRet)
 
+class TimerEvaluator {
+  uint64_t device_time_offset = 0;
+  uint64_t start_time = 0;
+  unsigned int start_frame;
+  double last_frame_time;
+  double last_host_time = std::numeric_limits<double>::quiet_NaN();
+  double pid_delta = 0;
+  double pid_integral = 0;
+  unsigned last_near_frame;
+
+public:
+  void run(const MV_FRAME_OUT_INFO_EX &stImageInfo, const char *camName) {
+    uint64_t dev_timestamp = (uint64_t)stImageInfo.nDevTimeStampHigh << 32 |
+                             stImageInfo.nDevTimeStampLow;
+    auto duration =
+        std::chrono::high_resolution_clock::now().time_since_epoch();
+    uint64_t cur_timestamp =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+    if (!start_time) {
+      start_time = cur_timestamp;
+    }
+    if (!device_time_offset && cur_timestamp > start_time + 500000000) {
+      // cur_timestamp = cur_timestamp / 1000000 * 1000000;
+      device_time_offset = dev_timestamp * 10 - cur_timestamp;
+      start_time = cur_timestamp;
+      start_frame = stImageInfo.nFrameNum;
+    }
+    double dev_time =
+        (dev_timestamp * 10 - device_time_offset - start_time) / 1000000.;
+    double host_time =
+        (stImageInfo.nHostTimeStamp * 1000000 - start_time) / 1000000.;
+    double cur_time = (cur_timestamp - start_time) / 1000000.;
+    double interval = (dev_time - last_frame_time) /
+                      (stImageInfo.nFrameNum - last_near_frame);
+    if (device_time_offset && !isnan(last_host_time) &&
+        cur_time - host_time < 10000) {
+      double diff = dev_time - cur_time - pid_delta;
+      // friction to limit i term
+      pid_integral += (diff - pid_integral / 100) * (cur_time - last_host_time);
+      pid_delta += diff / 1000 + pid_integral / 300000;
+    }
+    last_frame_time = dev_time;
+    last_host_time = cur_time;
+    double ppm = pid_delta / cur_time * 1000000.;
+    printf("Cam[%s]: Device[%13.5f](%+4.1f, %+.5f = "
+           "%+.3f%+.3f@%+05.1f, "
+           "%+05.1fppm, %.5f), "
+           "Host[%7.0f](%+.1f), "
+           "Current[%14.6f], [%u][%u]\n",
+           camName, dev_time, dev_time - host_time, dev_time - cur_time,
+           pid_delta, dev_time - cur_time - pid_delta, pid_integral, ppm,
+           interval, host_time, host_time - cur_time, cur_time,
+           stImageInfo.nFrameNum, stImageInfo.nFrameNum - last_near_frame);
+    last_near_frame = stImageInfo.nFrameNum;
+  }
+};
+
 class FrameWorker {
   JPEGEncoder encoder;
   unsigned int nDataSize;
@@ -30,6 +87,7 @@ class FrameWorker {
   unsigned int lost_frame_count = 0;
   unsigned int total_frame_count = 0;
   static inline std::mutex creation_mutex;
+  TimerEvaluator timer_evaluator;
   FrameWorker(cudaStream_t s, unsigned int nDataSize_, const char *camName_,
               const rclcpp::Publisher<CompressedImage>::SharedPtr &pub)
       : encoder(s), nDataSize(nDataSize_), camName(camName_), publisher(pub) {}
@@ -50,12 +108,11 @@ public:
   }
 
   void run(uint8_t *image_data, const MV_FRAME_OUT_INFO_EX &stImageInfo) {
-    // uint64_t timestamp = (uint64_t)stImageInfo.nDevTimeStampHigh << 32 |
-    //                      stImageInfo.nDevTimeStampLow;
-    // printf("Cam Serial Number[%s]: GetOneFrame, Width[%d], Height[%d], "
-    //        "nFrameNum[%d], timestamp[%ld], HostTimeStamp[%ld]\n",
+    // printf("Cam[%s]: GetOneFrame, Width[%d], Height[%d], nFrameNum[%d]\n",
     //        camName, stImageInfo.nWidth, stImageInfo.nHeight,
-    //        stImageInfo.nFrameNum, timestamp, stImageInfo.nHostTimeStamp);
+    //        stImageInfo.nFrameNum);
+    if (!strcmp(camName, "Color"))
+      timer_evaluator.run(stImageInfo, camName);
 
     cv::Mat image(stImageInfo.nHeight, stImageInfo.nWidth, CV_8UC1, image_data);
     uint8_t *out;
@@ -147,6 +204,7 @@ public:
     printf("Start %d camera Grabbing Image test\n", stDeviceList.nDeviceNum);
     for (unsigned i = 0; i < stDeviceList.nDeviceNum; i++) {
       const char *camName = GetCameraName(stDeviceList.pDeviceInfo[i]);
+      // if (strcmp(camName, "Color")) continue;
       void *handle;
       CHECK_MV_RETURN(MV_CC_CreateHandle(&handle, stDeviceList.pDeviceInfo[i]));
       // 打开设备
@@ -283,17 +341,13 @@ public:
       MV_FRAME_OUT frame;
       MV_FRAME_OUT_INFO_EX &stImageInfo = frame.stFrameInfo;
       CHECK_MV_OR(MV_CC_GetImageBuffer(handle, &frame, 100), continue);
+      // unsigned valid_num;
+      // CHECK_MV(MV_CC_GetValidImageNum(handle, &valid_num));
 
       frame_worker.run(frame.pBufAddr, stImageInfo);
 
       CHECK_MV(MV_CC_FreeImageBuffer(handle, &frame));
 
-      // unsigned valid_num;
-      // nRet = MV_CC_GetValidImageNum(handle, &valid_num);
-      // if (nRet != MV_OK) {
-      //   printf("Cam[%s]: MV_CC_GetValidImageNum failed![%x]\n", camName,
-      //   nRet); continue;
-      // }
       // if (valid_num > 1) {
       //   printf("Cam[%s]: %u valid images at frame[%u]\n", camName, valid_num,
       //          stImageInfo.nFrameNum);
@@ -326,7 +380,6 @@ public:
       if (nRet == MV_OK)
         printf("Cam[%s]: ADCBitDepth: %u\n", camName, ADCBitDepth.nCurValue);
     } else if ("Color"s == camName) {
-
     } else {
       printf("Warning: unrecognized camera\n");
     }
