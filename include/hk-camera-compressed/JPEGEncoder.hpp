@@ -27,7 +27,7 @@ struct JPEGEncoder {
     assert(encoder);
     gpujpeg_set_default_parameters(&param);
     // Use 4:2:0 subsampling
-    gpujpeg_parameters_chroma_subsampling(&param, GPUJPEG_SUBSAMPLING_420);
+    // gpujpeg_parameters_chroma_subsampling(&param, GPUJPEG_SUBSAMPLING_420);
     // param.verbose = true;
     param.restart_interval = RESTART_AUTO;
   }

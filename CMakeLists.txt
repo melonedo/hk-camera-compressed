@@ -43,7 +43,7 @@ target_link_libraries(hikrobot
     MediaProcess
 )
 
-add_executable(hk-camera src/main.cpp src/hk-utils.cpp)
+add_executable(hk-camera src/main.cpp src/hk-utils.cpp src/CameraMaster.cpp)
 target_include_directories(hk-camera PUBLIC include/hk-camera-compressed GPUJPEG)
 target_link_libraries(hk-camera hikrobot CUDA::cudart gpujpeg)
 ament_target_dependencies(hk-camera rclcpp std_msgs image_transport)
