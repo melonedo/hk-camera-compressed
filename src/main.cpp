@@ -42,7 +42,7 @@ int start_cameras() {
 
   CameraMaster master;
   pMaster = &master;
-  if (master.init())
+  if (master.init(400))
     return EXIT_FAILURE;
   if (master.start_grabbing())
     return EXIT_FAILURE;

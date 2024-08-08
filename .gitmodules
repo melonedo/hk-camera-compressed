@@ -1,4 +1,9 @@
 [submodule "GPUJPEG"]
 	path = GPUJPEG
 	url = https://github.com/CESNET/GPUJPEG.git
-	branch = 005ea2a
+[submodule "CppLinuxSerial"]
+	path = CppLinuxSerial
+	url = https://github.com/gbmhunter/CppLinuxSerial.git
+[submodule "serial"]
+	path = serial
+	url = https://github.com/melonedo/serial.git

@@ -23,6 +23,9 @@ find_package(OpenCV REQUIRED)
 
 add_subdirectory(GPUJPEG)
 
+add_subdirectory(serial)
+target_include_directories(serial PUBLIC serial/include)
+
 add_library(hikrobot INTERFACE)
 target_include_directories(hikrobot
   INTERFACE
@@ -45,7 +48,7 @@ target_link_libraries(hikrobot
 
 add_executable(hk-camera src/main.cpp src/hk-utils.cpp src/CameraMaster.cpp)
 target_include_directories(hk-camera PUBLIC include/hk-camera-compressed GPUJPEG)
-target_link_libraries(hk-camera hikrobot CUDA::cudart gpujpeg)
+target_link_libraries(hk-camera hikrobot CUDA::cudart gpujpeg serial)
 ament_target_dependencies(hk-camera rclcpp std_msgs image_transport)
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   target_compile_options(hk-camera PRIVATE -Wall -Wextra -Wpedantic)

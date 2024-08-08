@@ -1,4 +1,5 @@
 #include "CameraMaster.hpp"
+#include "SerialTrigger.hpp"
 
 #include <fstream>
 
@@ -47,11 +48,46 @@ void TimerEvaluator::run(const MV_FRAME_OUT_INFO_EX &stImageInfo,
   last_near_frame = stImageInfo.nFrameNum;
 }
 
+FrameWorker::FrameWorker(
+    cudaStream_t s, void *handle, TriggerManager &tm, const char *camName_,
+    const rclcpp::Publisher<CompressedImage>::SharedPtr &pub)
+    : encoder(s), trigger_manager(tm), camName(camName_), publisher(pub) {
+  int nRet;
+
+  MVCC_INTVALUE_EX stIntValue;
+  CHECK_MV(MV_CC_GetIntValueEx(handle, "PayloadSize", &stIntValue));
+  unsigned dataSize = stIntValue.nCurValue;
+  CHECK_MV(MV_CC_GetIntValueEx(handle, "Width", &stIntValue));
+  width = stIntValue.nCurValue;
+  CHECK_MV(MV_CC_GetIntValueEx(handle, "Height", &stIntValue));
+  height = stIntValue.nCurValue;
+  // Expect Bayer or Mono format instead of RGB
+  assert(dataSize == width * height);
+
+  MVCC_ENUMVALUE stEnumValue;
+  CHECK_MV(MV_CC_GetEnumValue(handle, "PixelFormat", &stEnumValue));
+  pixel_format = stEnumValue.nCurValue;
+  assert(pixel_format == PixelType_Gvsp_BayerRG8);
+
+  MVCC_FLOATVALUE stFloatValue;
+  CHECK_MV(MV_CC_GetFloatValue(handle, "AcquisitionFrameRate", &stFloatValue));
+  frame_rate = stFloatValue.fCurValue;
+  trigger_step = trigger_manager.get_frame_rate(camName, frame_rate);
+
+  // Warmup
+  cv::Mat image(height, width, CV_8UC1);
+  uint8_t *out;
+  size_t len;
+  nRet = encoder.encode_bayer(image, &out, &len);
+  if (nRet)
+    printf("Cam[%s]: encode failed[%d]\n", camName, nRet);
+}
+
 void FrameWorker::run(uint8_t *image_data,
                       const MV_FRAME_OUT_INFO_EX &stImageInfo) {
-  // printf("Cam[%s]: GetOneFrame, Width[%d], Height[%d], nFrameNum[%d]\n",
-  //        camName, stImageInfo.nWidth, stImageInfo.nHeight,
-  //        stImageInfo.nFrameNum);
+  printf("Cam[%s]: GetOneFrame, Width[%d], Height[%d], nFrameNum[%d]\n",
+         camName, stImageInfo.nWidth, stImageInfo.nHeight,
+         stImageInfo.nFrameNum);
   //   if (!strcmp(camName, "Color"))
   //     timer_evaluator.run(stImageInfo, camName);
 
@@ -71,18 +107,9 @@ void FrameWorker::run(uint8_t *image_data,
   //   cv::imshow(camName, image);
   //   cv::waitKey(1);
   // }
-
-  CompressedImage image_msg;
-  image_msg.format = "jpeg";
-  image_msg.data = {out, out + len};
-  image_msg.header.frame_id = stImageInfo.nFrameNum;
-  // FIXME: use correct timestamp
-  image_msg.header.stamp.sec = stImageInfo.nHostTimeStamp / 1000000;
-  image_msg.header.stamp.nanosec = stImageInfo.nHostTimeStamp % 1000 * 1000000;
-  publisher->publish(image_msg);
-
-  if (last_frame_num == 0) {
+  if (last_frame_num == UINT_MAX) {
     last_frame_num = stImageInfo.nFrameNum;
+    printf("Cam[%s]: First received frame is #%d\n", camName, last_frame_num);
   } else {
     lost_frame_count += stImageInfo.nFrameNum - 1 - last_frame_num;
     total_frame_count += stImageInfo.nFrameNum - last_frame_num;
@@ -91,11 +118,32 @@ void FrameWorker::run(uint8_t *image_data,
              lost_frame_count, total_frame_count, stImageInfo.nFrameNum);
     }
   }
+
+  CompressedImage image_msg;
+  image_msg.format = "jpeg";
+  image_msg.data = {out, out + len};
+  // Should be the name of a reference frame
+  // image_msg.header.frame_id = stImageInfo.nFrameNum;
+  using namespace std::chrono_literals;
+  if (uint64_t ts = trigger_manager.get_timestamp(
+          camName, stImageInfo.nFrameNum, trigger_step, 100ms)) {
+    image_msg.header.stamp.sec = ts / 1000000;
+    image_msg.header.stamp.nanosec =
+        stImageInfo.nHostTimeStamp % 1000000 * 1000;
+  } else {
+    // Fallback to host timestamp
+    image_msg.header.stamp.sec = stImageInfo.nHostTimeStamp / 1000000;
+    image_msg.header.stamp.nanosec =
+        stImageInfo.nHostTimeStamp % 1000 * 1000000;
+  }
+  publisher->publish(image_msg);
+
   last_frame_num = stImageInfo.nFrameNum;
 }
 
-int CameraMaster::init() {
+int CameraMaster::init(float trigger_rate) {
   node = rclcpp::Node::make_shared("hk_cameras");
+  trigger_manager.init(trigger_rate, buffer_time);
 
   int nRet = MV_OK;
   // ch:初始化SDK | en:Initialize SDK
@@ -190,8 +238,18 @@ int CameraMaster::start_grabbing() {
     // start grab image
     CHECK_MV_RETURN(MV_CC_StartGrabbing(handles[i]));
     threads[i] = std::thread(
-        [this, i, buffer_num]() { WorkThread(handles[i], buffer_num); });
+        [this, i, buffer_num] { WorkThread(handles[i], buffer_num); });
   }
+
+  threads.emplace_back([this] {
+    SerialTrigger trigger;
+    trigger.init(&trigger_manager, trigger_manager.get_buffer_size());
+    while (running.load(std::memory_order_relaxed)) {
+      trigger.spin();
+    }
+    trigger.stop();
+  });
+
   return nRet;
 }
 
@@ -233,7 +291,7 @@ int CameraMaster::stop() {
 }
 
 void CameraMaster::WorkThread(void *handle, int buffer_num) {
-  int nRet = MV_OK;
+  unsigned nRet = MV_OK;
   char camName[256];
   {
     MVCC_STRINGVALUE stStringValue = {};
@@ -243,18 +301,20 @@ void CameraMaster::WorkThread(void *handle, int buffer_num) {
              sizeof(stStringValue.chCurValue));
     }
   }
-  // std::vector<uint8_t> buf(nDataSize);
-  // MV_FRAME_OUT_INFO_EX stImageInfo = {};
 
-  // cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
-  FrameWorker frame_worker =
-      FrameWorker::create(handle, this, camName, buffer_num, node.get());
+  FrameWorker frame_worker = FrameWorker::create(
+      handle, trigger_manager, camName, buffer_num, node.get());
   while (running.load(std::memory_order_relaxed)) {
-    // nRet = MV_CC_GetOneFrameTimeout(handle, buf.data(), nDataSize,
-    //                                 &stImageInfo, 100);
     MV_FRAME_OUT frame;
     MV_FRAME_OUT_INFO_EX &stImageInfo = frame.stFrameInfo;
-    CHECK_MV_OR(MV_CC_GetImageBuffer(handle, &frame, 100), continue);
+
+    nRet = MV_CC_GetImageBuffer(handle, &frame, 1000);
+
+    if (nRet != MV_OK && nRet != MV_E_NODATA)
+      printf("Cam[%s]: MV_CC_GetImageBuffer failed[%x]\n", camName, nRet);
+    if (nRet != MV_OK)
+      continue;
+
     // unsigned valid_num;
     // CHECK_MV(MV_CC_GetValidImageNum(handle, &valid_num));
 
@@ -278,7 +338,9 @@ void CameraMaster::config_camera(void *handle, const char *camName) {
   if ("Fast"s == camName) {
     CHECK_MV(MV_CC_SetEnumValueByString(handle, "ADCBitDepth", "Bits_8"));
     CHECK_MV(MV_CC_SetFloatValue(handle, "ExposureTime", 2200));
-    CHECK_MV(MV_CC_SetEnumValueByString(handle, "PixelFormat", "BayerRG8"));;
+    CHECK_MV(MV_CC_SetEnumValueByString(handle, "PixelFormat", "BayerRG8"));
+    ;
+    CHECK_MV(MV_CC_SetFloatValue(handle, "AcquisitionFrameRate", 400));
   } else if ("Color"s == camName) {
   } else {
     printf("Warning: unrecognized camera\n");
@@ -287,7 +349,8 @@ void CameraMaster::config_camera(void *handle, const char *camName) {
   CHECK_MV(MV_CC_SetBoolValue(handle, "AcquisitionFrameRateEnable", false));
   CHECK_MV(MV_CC_SetEnumValueByString(handle, "TriggerMode", "On"));
   CHECK_MV(MV_CC_SetEnumValueByString(handle, "TriggerSource", "Line0"));
-  CHECK_MV(MV_CC_SetEnumValueByString(handle, "TriggerMode", "Off"));
+  // If without external trigger
+  // CHECK_MV(MV_CC_SetEnumValueByString(handle, "TriggerMode", "Off"));
 
   std::vector<uint8_t> xml_buf;
   unsigned xml_len;
